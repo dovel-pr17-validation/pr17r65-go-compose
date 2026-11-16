@@ -1,0 +1,198 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package watch
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+
+	"gotest.tools/v3/assert"
+)
+
+func TestDontWatchEachFile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("This test uses linux-specific inotify checks")
+	}
+
+	// fsnotify is not recursive, so we need to watch each directory
+	// you can watch individual files with fsnotify, but that is more prone to exhaust resources
+	// this test uses a Linux way to get the number of watches to make sure we're watching
+	// per-directory, not per-file
+	f := newNotifyFixture(t)
+
+	watched := f.TempDir("watched")
+
+	// there are a few different cases we want to test for because the code paths are slightly
+	// different:
+	// 1) initial: data there before we ever call watch
+	// 2) inplace: data we create while the watch is happening
+	// 3) staged: data we create in another directory and then atomically move into place
+
+	// initial
+	f.WriteFile(f.JoinPath(watched, "initial.txt"), "initial data")
+
+	initialDir := f.JoinPath(watched, "initial_dir")
+	if err := os.Mkdir(initialDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 100 {
+		f.WriteFile(f.JoinPath(initialDir, strconv.Itoa(i)), "initial data")
+	}
+
+	f.watch(watched)
+	f.fsync()
+	if len(f.events) != 0 {
+		t.Fatalf("expected 0 initial events; got %d events: %v", len(f.events), f.events)
+	}
+	f.events = nil
+
+	// inplace
+	inplace := f.JoinPath(watched, "inplace")
+	if err := os.Mkdir(inplace, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	f.WriteFile(f.JoinPath(inplace, "inplace.txt"), "inplace data")
+
+	inplaceDir := f.JoinPath(inplace, "inplace_dir")
+	if err := os.Mkdir(inplaceDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 100 {
+		f.WriteFile(f.JoinPath(inplaceDir, strconv.Itoa(i)), "inplace data")
+	}
+
+	f.fsync()
+	if len(f.events) < 100 {
+		t.Fatalf("expected >100 inplace events; got %d events: %v", len(f.events), f.events)
+	}
+	f.events = nil
+
+	// staged
+	staged := f.TempDir("staged")
+	f.WriteFile(f.JoinPath(staged, "staged.txt"), "staged data")
+
+	stagedDir := f.JoinPath(staged, "staged_dir")
+	if err := os.Mkdir(stagedDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 100 {
+		f.WriteFile(f.JoinPath(stagedDir, strconv.Itoa(i)), "staged data")
+	}
+
+	if err := os.Rename(staged, f.JoinPath(watched, "staged")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.fsync()
+	if len(f.events) < 100 {
+		t.Fatalf("expected >100 staged events; got %d events: %v", len(f.events), f.events)
+	}
+	f.events = nil
+
+	n, err := inotifyNodes()
+	assert.NilError(t, err)
+	if n > 10 {
+		t.Fatal("watching more than 10 files:", n)
+	}
+}
+
+func inotifyNodes() (int, error) {
+	pid := os.Getpid()
+
+	output, err := exec.Command("/bin/sh", "-c", fmt.Sprintf(
+		"find /proc/%d/fd -lname anon_inode:inotify -printf '%%hinfo/%%f\n' | xargs cat | grep -c '^inotify'", pid)).Output()
+	if err != nil {
+		return 0, fmt.Errorf("error running command to determine number of watched files: %w\n %s", err, output)
+	}
+
+	n, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil {
+		return 0, fmt.Errorf("couldn't parse number of watched files: %w", err)
+	}
+	return n, nil
+}
+
+func TestDontRecurseWhenWatchingParentsOfNonExistentFiles(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("This test uses linux-specific inotify checks")
+	}
+
+	f := newNotifyFixture(t)
+
+	watched := f.TempDir("watched")
+	f.watch(filepath.Join(watched, ".tiltignore"))
+
+	excludedDir := f.JoinPath(watched, "excluded")
+	for i := range 10 {
+		f.WriteFile(f.JoinPath(excludedDir, strconv.Itoa(i), "data.txt"), "initial data")
+	}
+	f.fsync()
+
+	n, err := inotifyNodes()
+	assert.NilError(t, err)
+	if n > 5 {
+		t.Fatal("watching more than 5 files:", n)
+	}
+}
+
+// A directory the current user cannot read costs us visibility into that
+// subtree, but it must not prevent the rest of the tree from being watched.
+//
+// Uses a real unreadable directory, so it is skipped as root and covers
+// nothing in CI. See watcher_naive_walk_test.go for the unit tests.
+func TestWatchRecursivelySkipsUnreadableDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission semantics differ on windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the permission bit this test relies on")
+	}
+
+	root := t.TempDir()
+	unreadable := filepath.Join(root, "unreadable")
+	if err := os.MkdirAll(filepath.Join(unreadable, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "watched.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o755) })
+
+	if _, err := os.ReadDir(unreadable); err == nil {
+		t.Skip("could not make the directory unreadable in this environment")
+	}
+
+	notify, err := NewWatcher([]string{root})
+	assert.NilError(t, err)
+	t.Cleanup(func() { _ = notify.Close() })
+
+	if err := notify.Start(); err != nil {
+		t.Fatalf("Start() must not fail because of an unreadable directory: %v", err)
+	}
+}

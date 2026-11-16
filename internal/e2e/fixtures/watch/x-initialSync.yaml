@@ -1,0 +1,12 @@
+services:
+  test:
+    build:
+      dockerfile_inline: |
+        FROM nginx
+        RUN mkdir /data/
+    develop:
+      watch:
+        - path: .
+          target: /data/
+          action: sync
+          x-initialSync: true

@@ -1,0 +1,525 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/netip"
+	"testing"
+
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/config/configfile"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"go.uber.org/mock/gomock"
+	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/internal/naming"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/mocks"
+)
+
+func TestContainerName(t *testing.T) {
+	s := types.ServiceConfig{
+		Name:          "testservicename",
+		ContainerName: "testcontainername",
+		Scale:         intPtr(1),
+		Deploy:        &types.DeployConfig{},
+	}
+	ret, err := getScale(s)
+	assert.NilError(t, err)
+	assert.Equal(t, ret, *s.Scale)
+
+	s.Scale = intPtr(0)
+	ret, err = getScale(s)
+	assert.NilError(t, err)
+	assert.Equal(t, ret, *s.Scale)
+
+	s.Scale = intPtr(2)
+	_, err = getScale(s)
+	assert.Error(t, err, fmt.Sprintf(doubledContainerNameWarning, s.Name, s.ContainerName))
+}
+
+func intPtr(i int) *int {
+	return &i
+}
+
+func TestServiceLinks(t *testing.T) {
+	const dbContainerName = "/" + testProject + "-db-1"
+	const webContainerName = "/" + testProject + "-web-1"
+	s := types.ServiceConfig{
+		Name:  "web",
+		Scale: intPtr(1),
+	}
+
+	containerListOptions := client.ContainerListOptions{
+		Filters: naming.ProjectFilter(testProject).Add("label",
+			naming.ServiceFilter("db"),
+			oneOffFilter(false),
+			api.ConfigHashLabel,
+		),
+		All: true,
+	}
+
+	t.Run("service links default", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+
+		apiClient := mocks.NewMockAPIClient(mockCtrl)
+		cli := mocks.NewMockCli(mockCtrl)
+		tested, err := NewComposeService(cli)
+		assert.NilError(t, err)
+		cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+		s.Links = []string{"db"}
+
+		c := testContainer("db", dbContainerName, false)
+		apiClient.EXPECT().ContainerList(gomock.Any(), containerListOptions).Return(client.ContainerListResult{
+			Items: []container.Summary{c},
+		}, nil)
+
+		links, err := tested.(*composeService).getLinks(t.Context(), testProject, s, 1)
+		assert.NilError(t, err)
+
+		assert.Equal(t, len(links), 3)
+		assert.Equal(t, links[0], "testProject-db-1:db")
+		assert.Equal(t, links[1], "testProject-db-1:db-1")
+		assert.Equal(t, links[2], "testProject-db-1:testProject-db-1")
+	})
+
+	t.Run("service links", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+		apiClient := mocks.NewMockAPIClient(mockCtrl)
+		cli := mocks.NewMockCli(mockCtrl)
+		tested, err := NewComposeService(cli)
+		assert.NilError(t, err)
+		cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+		s.Links = []string{"db:db"}
+
+		c := testContainer("db", dbContainerName, false)
+
+		apiClient.EXPECT().ContainerList(gomock.Any(), containerListOptions).Return(client.ContainerListResult{
+			Items: []container.Summary{c},
+		}, nil)
+		links, err := tested.(*composeService).getLinks(t.Context(), testProject, s, 1)
+		assert.NilError(t, err)
+
+		assert.Equal(t, len(links), 3)
+		assert.Equal(t, links[0], "testProject-db-1:db")
+		assert.Equal(t, links[1], "testProject-db-1:db-1")
+		assert.Equal(t, links[2], "testProject-db-1:testProject-db-1")
+	})
+
+	t.Run("service links name", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+		apiClient := mocks.NewMockAPIClient(mockCtrl)
+		cli := mocks.NewMockCli(mockCtrl)
+		tested, err := NewComposeService(cli)
+		assert.NilError(t, err)
+		cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+		s.Links = []string{"db:dbname"}
+
+		c := testContainer("db", dbContainerName, false)
+		apiClient.EXPECT().ContainerList(gomock.Any(), containerListOptions).Return(client.ContainerListResult{
+			Items: []container.Summary{c},
+		}, nil)
+
+		links, err := tested.(*composeService).getLinks(t.Context(), testProject, s, 1)
+		assert.NilError(t, err)
+
+		assert.Equal(t, len(links), 3)
+		assert.Equal(t, links[0], "testProject-db-1:dbname")
+		assert.Equal(t, links[1], "testProject-db-1:db-1")
+		assert.Equal(t, links[2], "testProject-db-1:testProject-db-1")
+	})
+
+	t.Run("service links external links", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+		apiClient := mocks.NewMockAPIClient(mockCtrl)
+		cli := mocks.NewMockCli(mockCtrl)
+		tested, err := NewComposeService(cli)
+		assert.NilError(t, err)
+		cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+		s.Links = []string{"db:dbname"}
+		s.ExternalLinks = []string{"db1:db2"}
+
+		c := testContainer("db", dbContainerName, false)
+		apiClient.EXPECT().ContainerList(gomock.Any(), containerListOptions).Return(client.ContainerListResult{
+			Items: []container.Summary{c},
+		}, nil)
+
+		links, err := tested.(*composeService).getLinks(t.Context(), testProject, s, 1)
+		assert.NilError(t, err)
+
+		assert.Equal(t, len(links), 4)
+		assert.Equal(t, links[0], "testProject-db-1:dbname")
+		assert.Equal(t, links[1], "testProject-db-1:db-1")
+		assert.Equal(t, links[2], "testProject-db-1:testProject-db-1")
+
+		// ExternalLink
+		assert.Equal(t, links[3], "db1:db2")
+	})
+
+	t.Run("service links itself oneoff", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+		apiClient := mocks.NewMockAPIClient(mockCtrl)
+		cli := mocks.NewMockCli(mockCtrl)
+		tested, err := NewComposeService(cli)
+		assert.NilError(t, err)
+		cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+		s.Links = []string{}
+		s.ExternalLinks = []string{}
+		s.Labels = s.Labels.Add(api.OneoffLabel, "True")
+
+		c := testContainer("web", webContainerName, true)
+		containerListOptionsOneOff := client.ContainerListOptions{
+			Filters: naming.ProjectFilter(testProject).Add("label",
+				naming.ServiceFilter("web"),
+				oneOffFilter(false),
+				api.ConfigHashLabel,
+			),
+			All: true,
+		}
+		apiClient.EXPECT().ContainerList(gomock.Any(), containerListOptionsOneOff).Return(client.ContainerListResult{
+			Items: []container.Summary{c},
+		}, nil)
+
+		links, err := tested.(*composeService).getLinks(t.Context(), testProject, s, 1)
+		assert.NilError(t, err)
+
+		assert.Equal(t, len(links), 3)
+		assert.Equal(t, links[0], "testProject-web-1:web")
+		assert.Equal(t, links[1], "testProject-web-1:web-1")
+		assert.Equal(t, links[2], "testProject-web-1:testProject-web-1")
+	})
+}
+
+func TestCreateMobyContainer(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	apiClient := mocks.NewMockAPIClient(mockCtrl)
+	cli := mocks.NewMockCli(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	cli.EXPECT().Client().Return(apiClient).AnyTimes()
+	cli.EXPECT().ConfigFile().Return(&configfile.ConfigFile{}).AnyTimes()
+	apiClient.EXPECT().DaemonHost().Return("").AnyTimes()
+	apiClient.EXPECT().ImageInspect(anyCancellableContext(), gomock.Any()).Return(client.ImageInspectResult{}, nil).AnyTimes()
+
+	apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).Return(client.PingResult{
+		APIVersion: "1.44",
+	}, nil).AnyTimes()
+	apiClient.EXPECT().ClientVersion().Return("1.44").AnyTimes()
+
+	service := types.ServiceConfig{
+		Name: "test", ContainerSpec: types.ContainerSpec{Networks: map[string]*types.ServiceNetworkConfig{
+			"a": {
+				Priority: 10,
+			},
+			"b": {
+				Priority: 100,
+			},
+		}},
+	}
+	project := types.Project{
+		Name: "bork",
+		Services: types.Services{
+			"test": service,
+		},
+		Networks: types.Networks{
+			"a": types.NetworkConfig{
+				Name: "a-moby-name",
+			},
+			"b": types.NetworkConfig{
+				Name: "b-moby-name",
+			},
+		},
+	}
+
+	var got client.ContainerCreateOptions
+	apiClient.EXPECT().ContainerCreate(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+		got = opts
+		return client.ContainerCreateResult{ID: "an-id"}, nil
+	})
+
+	apiClient.EXPECT().ContainerInspect(gomock.Any(), gomock.Eq("an-id"), gomock.Any()).Times(1).Return(client.ContainerInspectResult{
+		Container: container.InspectResponse{
+			ID:              "an-id",
+			Name:            "a-name",
+			Config:          &container.Config{},
+			NetworkSettings: &container.NetworkSettings{},
+		},
+	}, nil)
+
+	_, err = tested.(*composeService).createMobyContainer(t.Context(), &project, service, "test", 0, nil, createOptions{
+		Labels: make(types.Labels),
+	})
+	var falseBool bool
+	want := client.ContainerCreateOptions{
+		Config: &container.Config{
+			AttachStdout: true,
+			AttachStderr: true,
+			Image:        "bork-test",
+			Labels: map[string]string{
+				"com.docker.compose.config-hash": "8dbce408396f8986266bc5deba0c09cfebac63c95c2238e405c7bee5f1bd84b8",
+				"com.docker.compose.depends_on":  "",
+			},
+		},
+		HostConfig: &container.HostConfig{
+			PortBindings: network.PortMap{},
+			ExtraHosts:   []string{},
+			Tmpfs:        map[string]string{},
+			Resources: container.Resources{
+				OomKillDisable: &falseBool,
+			},
+			NetworkMode: "b-moby-name",
+		},
+		NetworkingConfig: &network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				"a-moby-name": {
+					IPAMConfig: &network.EndpointIPAMConfig{},
+					Aliases:    []string{"bork-test-0"},
+				},
+				"b-moby-name": {
+					IPAMConfig: &network.EndpointIPAMConfig{},
+					Aliases:    []string{"bork-test-0"},
+				},
+			},
+		},
+		Name: "test",
+	}
+	assert.DeepEqual(t, want, got, cmpopts.EquateComparable(netip.Addr{}), cmpopts.EquateEmpty())
+	assert.NilError(t, err)
+}
+
+func TestCreateMobyContainerLegacyAPI(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	apiClient := mocks.NewMockAPIClient(mockCtrl)
+	cli := mocks.NewMockCli(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	cli.EXPECT().Client().Return(apiClient).AnyTimes()
+	cli.EXPECT().ConfigFile().Return(&configfile.ConfigFile{}).AnyTimes()
+	apiClient.EXPECT().DaemonHost().Return("").AnyTimes()
+	apiClient.EXPECT().ImageInspect(anyCancellableContext(), gomock.Any()).
+		Return(client.ImageInspectResult{}, nil).AnyTimes()
+
+	apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).
+		Return(client.PingResult{APIVersion: "1.43"}, nil).AnyTimes()
+	apiClient.EXPECT().ClientVersion().Return("1.43").AnyTimes()
+
+	service := types.ServiceConfig{
+		Name: "test", ContainerSpec: types.ContainerSpec{Networks: map[string]*types.ServiceNetworkConfig{
+			"a": {Priority: 10},
+			"b": {Priority: 100},
+		}},
+	}
+	project := types.Project{
+		Name: "bork",
+		Services: types.Services{
+			"test": service,
+		},
+		Networks: types.Networks{
+			"a": types.NetworkConfig{Name: "a-moby-name"},
+			"b": types.NetworkConfig{Name: "b-moby-name"},
+		},
+	}
+
+	var gotCreate client.ContainerCreateOptions
+	apiClient.EXPECT().ContainerCreate(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			gotCreate = opts
+			return client.ContainerCreateResult{ID: "an-id"}, nil
+		})
+
+	// For API < 1.44, the secondary network "a" should be connected via NetworkConnect.
+	var gotConnect client.NetworkConnectOptions
+	connectCall := apiClient.EXPECT().
+		NetworkConnect(gomock.Any(), gomock.Eq("a-moby-name"), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, opts client.NetworkConnectOptions) (client.NetworkConnectResult, error) {
+			gotConnect = opts
+			return client.NetworkConnectResult{}, nil
+		})
+
+	apiClient.EXPECT().ContainerInspect(gomock.Any(), gomock.Eq("an-id"), gomock.Any()).
+		Times(1).After(connectCall).Return(client.ContainerInspectResult{
+		Container: container.InspectResponse{
+			ID:     "an-id",
+			Name:   "a-name",
+			Config: &container.Config{},
+			NetworkSettings: &container.NetworkSettings{
+				Networks: map[string]*network.EndpointSettings{
+					"b-moby-name": {
+						IPAMConfig: &network.EndpointIPAMConfig{},
+						Aliases:    []string{"bork-test-0"},
+					},
+					"a-moby-name": {
+						IPAMConfig: &network.EndpointIPAMConfig{},
+						Aliases:    []string{"bork-test-0"},
+					},
+				},
+			},
+		},
+	}, nil)
+
+	_, err = tested.(*composeService).createMobyContainer(t.Context(), &project, service, "test", 0, nil, createOptions{
+		Labels:            make(types.Labels),
+		UseNetworkAliases: true,
+	})
+	assert.NilError(t, err)
+
+	// ContainerCreate should only have the primary network (b, highest priority)
+	assert.Check(t, gotCreate.NetworkingConfig != nil)
+	assert.Equal(t, len(gotCreate.NetworkingConfig.EndpointsConfig), 1)
+	_, hasPrimary := gotCreate.NetworkingConfig.EndpointsConfig["b-moby-name"]
+	assert.Check(t, hasPrimary, "primary network b-moby-name should be in ContainerCreate EndpointsConfig")
+
+	// NetworkConnect should have been called for the secondary network "a"
+	assert.Equal(t, gotConnect.Container, "an-id")
+	assert.Check(t, gotConnect.EndpointConfig != nil)
+}
+
+func TestCreateMobyContainerLegacyAPI_NetworkConnectFailure(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+	apiClient := mocks.NewMockAPIClient(mockCtrl)
+	cli := mocks.NewMockCli(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	cli.EXPECT().Client().Return(apiClient).AnyTimes()
+	cli.EXPECT().ConfigFile().Return(&configfile.ConfigFile{}).AnyTimes()
+	apiClient.EXPECT().DaemonHost().Return("").AnyTimes()
+	apiClient.EXPECT().ImageInspect(anyCancellableContext(), gomock.Any()).
+		Return(client.ImageInspectResult{}, nil).AnyTimes()
+
+	apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).
+		Return(client.PingResult{APIVersion: "1.43"}, nil).AnyTimes()
+	apiClient.EXPECT().ClientVersion().Return("1.43").AnyTimes()
+
+	service := types.ServiceConfig{
+		Name: "test", ContainerSpec: types.ContainerSpec{Networks: map[string]*types.ServiceNetworkConfig{
+			"a": {Priority: 10},
+			"b": {Priority: 100},
+		}},
+	}
+	project := types.Project{
+		Name: "bork",
+		Services: types.Services{
+			"test": service,
+		},
+		Networks: types.Networks{
+			"a": types.NetworkConfig{Name: "a-moby-name"},
+			"b": types.NetworkConfig{Name: "b-moby-name"},
+		},
+	}
+
+	apiClient.EXPECT().ContainerCreate(gomock.Any(), gomock.Any()).
+		Return(client.ContainerCreateResult{ID: "an-id"}, nil)
+
+	// NetworkConnect fails
+	connectErr := errors.New("network connect failed")
+	apiClient.EXPECT().NetworkConnect(gomock.Any(), gomock.Eq("a-moby-name"), gomock.Any()).
+		Return(client.NetworkConnectResult{}, connectErr)
+
+	// ContainerRemove should be called to clean up the orphan container
+	apiClient.EXPECT().ContainerRemove(gomock.Any(), gomock.Eq("an-id"), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+			assert.Check(t, opts.Force, "ContainerRemove should use Force")
+			return client.ContainerRemoveResult{}, nil
+		})
+
+	_, err = tested.(*composeService).createMobyContainer(t.Context(), &project, service, "test", 0, nil, createOptions{
+		Labels:            make(types.Labels),
+		UseNetworkAliases: true,
+	})
+	assert.ErrorContains(t, err, "network connect failed")
+}
+
+func TestRuntimeAPIVersionCachesNegotiation(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	apiClient := mocks.NewMockAPIClient(mockCtrl)
+	cli := mocks.NewMockCli(mockCtrl)
+	tested := &composeService{dockerCli: cli}
+
+	cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+	// Ping reports the server's max API version (1.44), but after negotiation
+	// the client may settle on a lower version (1.43) — e.g. when the client
+	// SDK caps at an older version. RuntimeAPIVersion must return the negotiated
+	// ClientVersion, not the server's raw APIVersion.
+	apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).Return(client.PingResult{
+		APIVersion: "1.44",
+	}, nil).Times(1)
+	apiClient.EXPECT().ClientVersion().Return("1.43").Times(1)
+
+	version, err := tested.RuntimeAPIVersion(t.Context())
+	assert.NilError(t, err)
+	assert.Equal(t, version, "1.43")
+
+	version, err = tested.RuntimeAPIVersion(t.Context())
+	assert.NilError(t, err)
+	assert.Equal(t, version, "1.43")
+}
+
+func TestRuntimeAPIVersionRetriesOnTransientError(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	apiClient := mocks.NewMockAPIClient(mockCtrl)
+	cli := mocks.NewMockCli(mockCtrl)
+	tested := &composeService{dockerCli: cli}
+
+	cli.EXPECT().Client().Return(apiClient).AnyTimes()
+
+	// First call: Ping fails with a transient error
+	firstCall := apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).
+		Return(client.PingResult{}, context.DeadlineExceeded).Times(1)
+
+	// Second call: Ping succeeds after the transient failure
+	apiClient.EXPECT().Ping(gomock.Any(), client.PingOptions{NegotiateAPIVersion: true}).
+		Return(client.PingResult{APIVersion: "1.44"}, nil).Times(1).After(firstCall)
+	apiClient.EXPECT().ClientVersion().Return("1.44").Times(1)
+
+	// First call should return the transient error
+	_, err := tested.RuntimeAPIVersion(t.Context())
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Second call should succeed — error was not cached
+	version, err := tested.RuntimeAPIVersion(t.Context())
+	assert.NilError(t, err)
+	assert.Equal(t, version, "1.44")
+
+	// Third call should return the cached value without calling Ping again
+	version, err = tested.RuntimeAPIVersion(t.Context())
+	assert.NilError(t, err)
+	assert.Equal(t, version, "1.44")
+}

@@ -1,0 +1,69 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/moby/moby/api/types/jsonstream"
+
+	"github.com/docker/compose/v5/internal/progress"
+	"github.com/docker/compose/v5/pkg/api"
+)
+
+type progressFunc func(context.Context) error
+
+func Run(ctx context.Context, pf progressFunc, operation string, bus api.EventProcessor) error {
+	bus.Start(ctx, operation)
+	err := pf(ctx)
+	bus.Done(operation, err == nil)
+	return err
+}
+
+// errorEventf creates a new Error Resource with format message
+func errorEventf(id string, msg string, args ...any) api.Resource {
+	return progress.Error(id, fmt.Sprintf(msg, args...))
+}
+
+// decodeProgressStream reads the JSON messages the daemon streams while pulling or
+// pushing an image, handing each of them to onMessage. It stops at the first
+// message carrying an error, which it returns.
+func decodeProgressStream(stream io.Reader, onMessage func(jsonstream.Message)) error {
+	dec := json.NewDecoder(stream)
+	for {
+		var jm jsonstream.Message
+		if err := dec.Decode(&jm); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if jm.Error != nil {
+			return errors.New(jm.Error.Message)
+		}
+		onMessage(jm)
+	}
+}
+
+// progressPercent is how far current is from total, which must be positive, in percent.
+func progressPercent(current, total int64) int {
+	return min(int(current*100/total), 100)
+}

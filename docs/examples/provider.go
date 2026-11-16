@@ -1,0 +1,453 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package main
+
+import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http/httputil"
+	"os"
+	"os/exec"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+func main() {
+	cmd := &cobra.Command{
+		Short: "Compose Provider Example",
+		Use:   "demo",
+	}
+	cmd.AddCommand(composeCommand())
+	cmd.AddCommand(serveDemoCommand())
+	err := cmd.Execute()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+type options struct {
+	db   string
+	size int
+}
+
+func composeCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:              "compose EVENT",
+		TraverseChildren: true,
+	}
+	c.PersistentFlags().String("project-name", "", "compose project name") // unused
+
+	var options options
+	upCmd := &cobra.Command{
+		Use: "up",
+		Run: func(_ *cobra.Command, args []string) {
+			up(options, args)
+		},
+		Args: cobra.ExactArgs(1),
+	}
+
+	upCmd.Flags().StringVar(&options.db, "type", "", "Database type (mysql, postgres, etc.)")
+	_ = upCmd.MarkFlagRequired("type")
+	upCmd.Flags().IntVar(&options.size, "size", 10, "Database size in GB")
+	upCmd.Flags().String("name", "", "Name of the database to be created")
+	_ = upCmd.MarkFlagRequired("name")
+
+	downCmd := &cobra.Command{
+		Use:  "down",
+		Run:  down,
+		Args: cobra.ExactArgs(1),
+	}
+	downCmd.Flags().String("name", "", "Name of the database to be deleted")
+	_ = downCmd.MarkFlagRequired("name")
+
+	stopCmd := &cobra.Command{
+		Use:  "stop",
+		Run:  stop,
+		Args: cobra.ExactArgs(1),
+	}
+
+	// pull is the image-distribution command: compose invokes it during the
+	// image phase (up) and on `docker compose pull`, passing the identity of
+	// the service image and the state of the local daemon cache. None of its
+	// flags is required: they are injected by compose, not declared by the
+	// user under provider.options.
+	pullCmd := &cobra.Command{
+		Use:  "pull",
+		Run:  pull,
+		Args: cobra.ExactArgs(1),
+	}
+	pullCmd.Flags().String("image", "", "Image reference as compose resolved it")
+	pullCmd.Flags().String("digest", "", "Image ID in the local daemon cache, when present")
+	pullCmd.Flags().String("created", "", "Creation time of the local cache entry, when present")
+	pullCmd.Flags().String("source", "", "Authority verdict: local (sync from the daemon) or registry (resolve upstream)")
+	pullCmd.Flags().String("policy", "", "missing (a usable version suffices) or always (ensure freshness)")
+
+	c.AddCommand(upCmd, downCmd, stopCmd, pullCmd)
+	c.AddCommand(metadataCommand(upCmd, downCmd, stopCmd, pullCmd))
+	return c
+}
+
+// pull demonstrates the image-distribution contract. A real provider would
+// compare the announced digest/created with its bookkeeping and either
+// resolve the reference upstream (source=registry) or request the local
+// bytes (source=local). This demo requests the stream whenever
+// PROVIDER_PULL_MARKER is set, hashes it, and records the outcome there.
+func pull(cmd *cobra.Command, args []string) {
+	image, _ := cmd.Flags().GetString("image")
+	digest, _ := cmd.Flags().GetString("digest")
+	created, _ := cmd.Flags().GetString("created")
+	source, _ := cmd.Flags().GetString("source")
+	policy, _ := cmd.Flags().GetString("policy")
+
+	emit := func(kind, message string) {
+		payload, _ := json.Marshal(map[string]string{"type": kind, "message": message})
+		fmt.Println(string(payload))
+	}
+	emit("info", fmt.Sprintf("ensuring image %s (source=%s, policy=%s)", image, source, policy))
+
+	marker := os.Getenv("PROVIDER_PULL_MARKER")
+	if marker == "" {
+		// nothing to synchronize in the demo: a real registry-sourced provider
+		// would pull the reference upstream here
+		return
+	}
+
+	// Request the image bytes from the local daemon. The answer is one JSON
+	// line, then — unless it carries an error — the tar as an HTTP/1.1
+	// chunked body (readable with any stock chunked reader), whose zero
+	// chunk marks a COMPLETE transfer.
+	request, _ := json.Marshal(map[string]string{"type": "get-image", "message": image})
+	fmt.Println(string(request))
+
+	stdin := bufio.NewReader(os.Stdin)
+	line, err := stdin.ReadString('\n')
+	if err != nil {
+		emit("error", "reading image-stream announce: "+err.Error())
+		os.Exit(1)
+	}
+	var announce struct {
+		Encoding string `json:"encoding"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(line), &announce); err != nil || announce.Error != "" || announce.Encoding != "chunked" {
+		emit("error", fmt.Sprintf("image stream unavailable: %q (err %v)", line, err))
+		os.Exit(1)
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, httputil.NewChunkedReader(stdin))
+	if err != nil {
+		emit("error", "image stream truncated: "+err.Error())
+		os.Exit(1)
+	}
+	record := fmt.Sprintf("image=%s digest=%s created=%s source=%s policy=%s sha256=%x bytes=%d\n",
+		image, digest, created, source, policy, h.Sum(nil), n)
+	if err := os.WriteFile(marker, []byte(record), 0o600); err != nil {
+		emit("error", "writing marker: "+err.Error())
+		os.Exit(1)
+	}
+	emit("info", fmt.Sprintf("image received (%d bytes)", n))
+}
+
+// serveDemoCommand is the detached helper process behind the
+// publish-endpoint demonstration: a TCP server on the given address
+// answering every connection with a fixed HTTP response, exiting on its own
+// after three minutes. It owns the port from bind to exit: the bound address
+// is reported on stdout once listening, so the parent never has to probe or
+// pre-reserve the port (no TOCTOU window, and works on Windows where handing
+// a socket over ExtraFiles is not supported).
+func serveDemoCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:    "serve-demo ADDR",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			listener, err := net.Listen("tcp", args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Println(listener.Addr().String())
+			go func() {
+				time.Sleep(3 * time.Minute)
+				os.Exit(0)
+			}()
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return err
+				}
+				go func() {
+					defer func() { _ = conn.Close() }()
+					buf := make([]byte, 1024)
+					_, _ = conn.Read(buf)
+					_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 19\r\nConnection: close\r\n\r\nhello from provider"))
+				}()
+			}
+		},
+	}
+}
+
+const lineSeparator = "\n"
+
+func up(options options, args []string) {
+	servicename := args[0]
+	fmt.Printf(`{ "type": "debug", "message": "Starting %s" }%s`, servicename, lineSeparator)
+
+	// Ask the running Compose process for the resolved definition of the
+	// service this provider manages. A Compose that predates the message
+	// aborts on it, so only providers that require the configuration
+	// should send it. The decoder must be created once and reused across
+	// requests: it reads ahead, so a fresh decoder per request would discard
+	// buffered bytes and hang on the next answer.
+	responses := json.NewDecoder(os.Stdin)
+	fmt.Printf(`{ "type": "get-service-config" }%s`, lineSeparator)
+	// Only what this example reads is decoded. Compose sends the whole
+	// resolved service, scale included and unmodified: it never rejects or
+	// acts on the scale of a provider-backed service, and the relay it deploys
+	// stays a single container. compose-go's types.ServiceConfig can't be used
+	// to read it back: a few fields marshal into a form that type fails to
+	// decode (extra_hosts, scalar ulimits, secret modes).
+	var config struct {
+		Provider struct {
+			Type string `json:"type"`
+		} `json:"provider"`
+		Scale  *int `json:"scale"`
+		Deploy *struct {
+			Replicas *int `json:"replicas"`
+		} `json:"deploy"`
+	}
+	if err := responses.Decode(&config); err != nil {
+		// error text is not JSON-safe either: encode, don't interpolate
+		msg, _ := json.Marshal(map[string]string{"type": "error", "message": fmt.Sprintf("get-service-config failed: %v", err)})
+		fmt.Println(string(msg))
+		return
+	}
+	// values read from the configuration are not necessarily JSON-safe:
+	// encode the message instead of interpolating it into a JSON literal
+	setenv, _ := json.Marshal(map[string]string{"type": "setenv", "message": "CONFIG_TYPE=" + config.Provider.Type})
+	fmt.Println(string(setenv))
+	// same precedence as compose-go's GetScale(): scale:, then
+	// deploy.replicas:, then 1
+	scale := 1
+	switch {
+	case config.Scale != nil:
+		scale = *config.Scale
+	case config.Deploy != nil && config.Deploy.Replicas != nil:
+		scale = *config.Deploy.Replicas
+	}
+	scaleEnv, _ := json.Marshal(map[string]string{"type": "setenv", "message": fmt.Sprintf("CONFIG_SCALE=%d", scale)})
+	fmt.Println(string(scaleEnv))
+
+	// When asked to, stand up a real endpoint on the host and publish it, so
+	// compose deploys a relay and consumers reach it as http://<service>:80.
+	if os.Getenv("PROVIDER_DEMO_ENDPOINT") != "" {
+		// Bind the address compose announces (get-relay-info): compose
+		// owns the platform knowledge — the network's gateway on a
+		// standalone engine, the host's loopback under Docker Desktop —
+		// so the endpoint is reachable from the relay without exposing
+		// the port on the LAN (see docs/extension.md, "Binding a local
+		// endpoint for the relay"). The wildcard remains the fallback
+		// when no gateway is announced (compose without get-relay-info,
+		// exotic network driver).
+		bindAddr := "0.0.0.0:0"
+		if gateway := relayGateway(responses); gateway != "" {
+			bindAddr = gateway + ":0"
+		}
+		// The subprocess binds the port itself and reports the resulting
+		// address on its stdout; only then is the endpoint published. This
+		// avoids the two races of a pre-reserved port: another process
+		// grabbing it between release and re-bind, and publish-endpoint
+		// pointing at a server that is not listening yet.
+		addr, err := serveDemo(bindAddr)
+		if err != nil {
+			fmt.Printf(`{ "type": "error", "message": "demo endpoint: %v" }%s`, err, lineSeparator)
+			return
+		}
+		// The endpoint is announced as bound: a gateway-bound address is
+		// routable and reaches the relay untouched; the wildcard is
+		// announced as seen from THIS process's host — the relay
+		// translates loopback/host-relative into the container-visible
+		// name.
+		host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+		if err != nil {
+			msg, _ := json.Marshal(map[string]string{"type": "error", "message": fmt.Sprintf("demo endpoint reported an invalid address %q: %v", strings.TrimSpace(addr), err)})
+			fmt.Println(string(msg))
+			return
+		}
+		endpoint := "localhost:" + port
+		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+			endpoint = net.JoinHostPort(host, port)
+		}
+		msg, _ := json.Marshal(map[string]string{"type": "publish-endpoint", "message": "80=" + endpoint})
+		fmt.Println(string(msg))
+	}
+
+	for i := 0; i < options.size; i += 10 {
+		time.Sleep(1 * time.Second)
+		fmt.Printf(`{ "type": "info", "message": "Processing ... %d%%" }%s`, i*100/options.size, lineSeparator)
+	}
+	fmt.Printf(`{ "type": "setenv", "message": "URL=https://magic.cloud/%s" }%s`, servicename, lineSeparator)
+	fmt.Printf(`{ "type": "rawsetenv", "message": "CLOUD_REGION=us-east-1" }%s`, lineSeparator)
+}
+
+// relayGateway asks compose (get-relay-info) for the gateway of a network
+// the relay will join, when the running compose announces support for the
+// message (COMPOSE_PROVIDER_MESSAGES) — empty otherwise, or when no gateway
+// resolved: the caller falls back to another bind address.
+func relayGateway(responses *json.Decoder) string {
+	if !slices.Contains(strings.Split(os.Getenv("COMPOSE_PROVIDER_MESSAGES"), ","), "get-relay-info") {
+		return ""
+	}
+	fmt.Printf(`{ "type": "get-relay-info", "message": "" }%s`, lineSeparator)
+	var answer struct {
+		Networks []struct {
+			Gateway string `json:"gateway"`
+		} `json:"networks"`
+	}
+	if err := responses.Decode(&answer); err != nil {
+		return ""
+	}
+	for _, network := range answer.Networks {
+		if network.Gateway != "" {
+			return network.Gateway
+		}
+	}
+	return ""
+}
+
+// serveDemo spawns the serve-demo subprocess on the given address and
+// returns the bound address it reported. The subprocess deliberately
+// outlives this invocation — it IS the provisioned resource the relay
+// forwards to, and consumers connect through it only after up has returned,
+// so reaping it here would tear the endpoint down before anyone reached it.
+// Its lifetime is its own: it exits by itself after three minutes
+// (serve-demo), the way a real provider's resource outlives the provider CLI
+// run. No Wait() and no zombie either: this process exits within seconds, so
+// the subprocess is long re-parented to init — which reaps it — when its
+// three minutes are up.
+func serveDemo(bindAddr string) (string, error) {
+	server := exec.Command(os.Args[0], "serve-demo", bindAddr)
+	stdout, err := server.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := server.Start(); err != nil {
+		// Start never succeeded, so Wait will never run and close the
+		// pipe's read end: release it here
+		_ = stdout.Close()
+		return "", err
+	}
+	// A failed bind exits the subprocess and closes the pipe (EOF below).
+	// A hung subprocess would block the read forever, so kill it after a
+	// deadline — the read then fails with EOF and lands on the same path.
+	watchdog := time.AfterFunc(30*time.Second, func() { _ = server.Process.Kill() })
+	addr, err := bufio.NewReader(stdout).ReadString('\n')
+	watchdog.Stop()
+	if err != nil {
+		// the subprocess outlives this function so nothing else calls
+		// Wait() to close the pipe's read end: release it here
+		_ = stdout.Close()
+		return "", fmt.Errorf("bind %s: endpoint did not come up: %w", bindAddr, err)
+	}
+	return addr, nil
+}
+
+func down(_ *cobra.Command, _ []string) {
+	// A failing down can be simulated for tests and demos.
+	if os.Getenv("PROVIDER_DOWN_FAILURE") != "" {
+		fmt.Printf(`{ "type": "error", "message": "Permission error" }%s`, lineSeparator)
+		return
+	}
+	fmt.Printf(`{ "type": "info", "message": "Resource removed" }%s`, lineSeparator)
+}
+
+func stop(_ *cobra.Command, _ []string) {
+	if marker := os.Getenv("PROVIDER_STOP_MARKER"); marker != "" {
+		_ = os.WriteFile(marker, []byte("stopped"), 0o600)
+	}
+}
+
+func metadataCommand(upCmd, downCmd, stopCmd, pullCmd *cobra.Command) *cobra.Command {
+	return &cobra.Command{
+		Use: "metadata",
+		Run: func(cmd *cobra.Command, _ []string) {
+			metadata(upCmd, downCmd, stopCmd, pullCmd)
+		},
+		Args: cobra.NoArgs,
+	}
+}
+
+func metadata(upCmd, downCmd, stopCmd, pullCmd *cobra.Command) {
+	metadata := ProviderMetadata{}
+	metadata.Description = "Manage services on AwesomeCloud"
+	metadata.Up = commandParameters(upCmd)
+	metadata.Down = commandParameters(downCmd)
+	stopParams := commandParameters(stopCmd)
+	metadata.Stop = &stopParams
+	// like stop, declaring the pull block is what opts the provider into
+	// image distribution
+	pullParams := commandParameters(pullCmd)
+	metadata.Pull = &pullParams
+	jsonMetadata, err := json.Marshal(metadata)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(jsonMetadata))
+}
+
+func commandParameters(cmd *cobra.Command) CommandMetadata {
+	cmdMetadata := CommandMetadata{}
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		_, isRequired := f.Annotations[cobra.BashCompOneRequiredFlag]
+		cmdMetadata.Parameters = append(cmdMetadata.Parameters, Metadata{
+			Name:        f.Name,
+			Description: f.Usage,
+			Required:    isRequired,
+			Type:        f.Value.Type(),
+			Default:     f.DefValue,
+		})
+	})
+	return cmdMetadata
+}
+
+type ProviderMetadata struct {
+	Description string           `json:"description"`
+	Up          CommandMetadata  `json:"up"`
+	Down        CommandMetadata  `json:"down"`
+	Stop        *CommandMetadata `json:"stop,omitempty"`
+	Pull        *CommandMetadata `json:"pull,omitempty"`
+}
+
+type CommandMetadata struct {
+	Parameters []Metadata `json:"parameters"`
+}
+
+type Metadata struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Required    bool   `json:"required"`
+	Type        string `json:"type"`
+	Default     string `json:"default,omitempty"`
+}

@@ -1,0 +1,45 @@
+# this workflow runs the remote validate bake target from docker/docs
+# to check if yaml reference docs used in this repo are valid
+name: docs-upstream
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'v[0-9]*'
+    paths:
+      - '.github/workflows/docs-upstream.yml'
+      - 'docs/**'
+  pull_request:
+    paths:
+      - '.github/workflows/docs-upstream.yml'
+      - 'docs/**'
+
+jobs:
+  docs-yaml:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Upload reference YAML docs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs-yaml
+          path: docs/reference
+          retention-days: 1
+
+  validate:
+    uses: docker/docs/.github/workflows/validate-upstream.yml@main # zizmor: ignore[unpinned-uses] needs to validate against latest docs changes
+    needs:
+      - docs-yaml
+    with:
+      module-name: docker/compose

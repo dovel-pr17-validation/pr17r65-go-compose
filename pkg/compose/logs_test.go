@@ -1,0 +1,627 @@
+/*
+   Copyright 2022 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	containerType "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/client"
+	"go.uber.org/mock/gomock"
+	"golang.org/x/sync/semaphore"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+
+	"github.com/docker/compose/v5/internal/naming"
+	compose "github.com/docker/compose/v5/pkg/api"
+)
+
+// newStdWriter is copied from github.com/moby/moby/daemon/internal/stdcopymux
+// because NewStdWriter was moved to a daemon-internal package in moby v2 and
+// is no longer publicly importable. We need it in tests to produce multiplexed
+// streams that stdcopy.StdCopy can demultiplex.
+
+const (
+	stdWriterPrefixLen = 8
+	stdWriterFdIndex   = 0
+	stdWriterSizeIndex = 4
+)
+
+var bufPool = &sync.Pool{New: func() any { return bytes.NewBuffer(nil) }}
+
+type stdWriter struct {
+	io.Writer
+	prefix byte
+}
+
+func (w *stdWriter) Write(p []byte) (int, error) {
+	if w == nil || w.Writer == nil {
+		return 0, errors.New("writer not instantiated")
+	}
+	if p == nil {
+		return 0, nil
+	}
+
+	header := [stdWriterPrefixLen]byte{stdWriterFdIndex: w.prefix}
+	binary.BigEndian.PutUint32(header[stdWriterSizeIndex:], uint32(len(p)))
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Write(header[:])
+	buf.Write(p)
+
+	n, err := w.Writer.Write(buf.Bytes())
+	n -= stdWriterPrefixLen
+	if n < 0 {
+		n = 0
+	}
+
+	buf.Reset()
+	bufPool.Put(buf)
+	return n, err
+}
+
+func newStdWriter(w io.Writer, streamType stdcopy.StdType) io.Writer {
+	return &stdWriter{
+		Writer: w,
+		prefix: byte(streamType),
+	}
+}
+
+func TestComposeService_Logs_Demux(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	api.EXPECT().ContainerList(t.Context(), client.ContainerListOptions{
+		All:     true,
+		Filters: naming.ProjectFilter(name).Add("label", oneOffFilter(false), compose.ConfigHashLabel),
+	}).Return(
+		client.ContainerListResult{
+			Items: []containerType.Summary{
+				testContainer("service", "c", false),
+			},
+		},
+		nil,
+	)
+
+	api.EXPECT().
+		ContainerInspect(anyCancellableContext(), "c", gomock.Any()).
+		Return(client.ContainerInspectResult{
+			Container: containerType.InspectResponse{
+				ID:     "c",
+				Config: &containerType.Config{Tty: false},
+			},
+		}, nil)
+	c1Reader, c1Writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = c1Reader.Close()
+		_ = c1Writer.Close()
+	})
+	c1Stdout := newStdWriter(c1Writer, stdcopy.Stdout)
+	c1Stderr := newStdWriter(c1Writer, stdcopy.Stderr)
+	go func() {
+		_, err := c1Stdout.Write([]byte("hello stdout\n"))
+		assert.NilError(t, err, "Writing to fake stdout")
+		_, err = c1Stderr.Write([]byte("hello stderr\n"))
+		assert.NilError(t, err, "Writing to fake stderr")
+		_ = c1Writer.Close()
+	}()
+	api.EXPECT().ContainerLogs(anyCancellableContext(), "c", gomock.Any()).
+		Return(c1Reader, nil)
+
+	opts := compose.LogOptions{
+		Project: &types.Project{
+			Services: types.Services{
+				"service": {Name: "service"},
+			},
+		},
+	}
+
+	consumer := &testLogConsumer{}
+	err = tested.Logs(t.Context(), name, consumer, opts)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, []string{"hello stdout", "hello stderr"}, consumer.LogsForContainer("c"))
+}
+
+// TestComposeService_Logs_ServiceFiltering ensures that we do not include
+// logs from out-of-scope services based on the Compose file vs actual state.
+//
+// NOTE(milas): This test exists because each method is currently duplicating
+// a lot of the project/service filtering logic. We should consider moving it
+// to an earlier point in the loading process, at which point this test could
+// safely be removed.
+func TestComposeService_Logs_ServiceFiltering(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	api.EXPECT().ContainerList(t.Context(), client.ContainerListOptions{
+		All:     true,
+		Filters: naming.ProjectFilter(name).Add("label", oneOffFilter(false), compose.ConfigHashLabel),
+	}).Return(
+		client.ContainerListResult{
+			Items: []containerType.Summary{
+				testContainer("serviceA", "c1", false),
+				testContainer("serviceA", "c2", false),
+				// serviceB will be filtered out by the project definition to
+				// ensure we ignore "orphan" containers
+				testContainer("serviceB", "c3", false),
+				testContainer("serviceC", "c4", false),
+			},
+		},
+		nil,
+	)
+
+	for _, id := range []string{"c1", "c2", "c4"} {
+		api.EXPECT().
+			ContainerInspect(anyCancellableContext(), id, gomock.Any()).
+			Return(
+				client.ContainerInspectResult{
+					Container: containerType.InspectResponse{
+						ID:     id,
+						Config: &containerType.Config{Tty: true},
+					},
+				},
+				nil,
+			)
+		api.EXPECT().ContainerLogs(anyCancellableContext(), id, gomock.Any()).
+			Return(io.NopCloser(strings.NewReader("hello "+id+"\n")), nil).
+			Times(1)
+	}
+
+	// this simulates passing `--filename` with a Compose file that does NOT
+	// reference `serviceB` even though it has running services for this proj
+	proj := &types.Project{
+		Services: types.Services{
+			"serviceA": {Name: "serviceA"},
+			"serviceC": {Name: "serviceC"},
+		},
+	}
+	consumer := &testLogConsumer{}
+	opts := compose.LogOptions{
+		Project: proj,
+	}
+	err = tested.Logs(t.Context(), name, consumer, opts)
+	assert.NilError(t, err)
+
+	assert.Assert(t, is.DeepEqual([]string{"hello c1"}, consumer.LogsForContainer("c1")))
+	assert.Assert(t, is.DeepEqual([]string{"hello c2"}, consumer.LogsForContainer("c2")))
+	assert.Assert(t, is.Len(consumer.LogsForContainer("c3"), 0))
+	assert.Assert(t, is.DeepEqual([]string{"hello c4"}, consumer.LogsForContainer("c4")))
+}
+
+// TestComposeService_Logs_FollowDoesNotStarveMonitor guards against a
+// regression where bounding the errgroup used for `--follow` log streams
+// (which never return) starved the monitor goroutine, submitted after them
+// to the same group: once maxConcurrency streams were open, the monitor
+// never started and later containers never appeared.
+func TestComposeService_Logs_FollowDoesNotStarveMonitor(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli, WithMaxConcurrency(1))
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	expectNowAsDaemonTime(api)
+	api.EXPECT().ContainerList(gomock.Any(), gomock.Any()).
+		Return(client.ContainerListResult{
+			Items: []containerType.Summary{
+				testContainer("service", "c1", false),
+				testContainer("service", "c2", false),
+			},
+		}, nil).
+		Times(2) // selectLogsContainers, then the monitor's initialContainers
+
+	writers := make(map[string]*io.PipeWriter)
+	// opened only fires once a container's stream is actually established
+	// (post-semaphore, mid-copy): closing writers before that would race
+	// with the semaphore-gated open itself, closing a pipe nothing reads yet.
+	opened := make(chan struct{}, 2)
+	for _, id := range []string{"c1", "c2"} {
+		r, w := io.Pipe()
+		writers[id] = w
+		t.Cleanup(func() { _ = r.Close() })
+
+		api.EXPECT().
+			ContainerInspect(anyCancellableContext(), id, gomock.Any()).
+			Return(client.ContainerInspectResult{
+				Container: containerType.InspectResponse{
+					ID:     id,
+					Config: &containerType.Config{Tty: false},
+				},
+			}, nil)
+		// never closed on its own: simulates a `--follow` stream that stays
+		// open for the container's lifetime
+		api.EXPECT().ContainerLogs(anyCancellableContext(), id, gomock.Any()).
+			DoAndReturn(func(context.Context, string, client.ContainerLogsOptions) (io.ReadCloser, error) {
+				opened <- struct{}{}
+				return r, nil
+			})
+	}
+
+	started := make(chan struct{})
+	api.EXPECT().Events(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ client.EventsListOptions) client.EventsResult {
+			close(started)
+			return client.EventsResult{Messages: make(chan events.Message), Err: make(chan error)}
+		})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tested.Logs(ctx, name, &testLogConsumer{}, compose.LogOptions{Follow: true})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor never started: follow-mode log streams starved the bounded errgroup")
+	}
+	for range 2 {
+		select {
+		case <-opened:
+		case <-time.After(5 * time.Second):
+			t.Fatal("not every container's log stream opened")
+		}
+	}
+
+	cancel()
+	for _, w := range writers {
+		_ = w.Close()
+	}
+	assert.NilError(t, <-done)
+}
+
+// TestComposeService_Logs_FollowFailsWithoutDaemonTime: `logs --follow` shares
+// the monitor, and a daemon that answers with a time that can't be used fails
+// the command (the error reaches Logs' caller, and the open log streams are
+// brought down) instead of following with no sound starting point for events.
+func TestComposeService_Logs_FollowFailsWithoutDaemonTime(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	api.EXPECT().Info(gomock.Any(), gomock.Any()).Return(client.SystemInfoResult{Info: system.Info{SystemTime: "yesterday-ish"}}, nil)
+	api.EXPECT().ContainerList(gomock.Any(), gomock.Any()).
+		Return(client.ContainerListResult{Items: []containerType.Summary{testContainer("service", "c1", false)}}, nil)
+	// the failure may cancel the group before the stream got as far as this
+	api.EXPECT().ContainerInspect(anyCancellableContext(), "c1", gomock.Any()).
+		Return(client.ContainerInspectResult{
+			Container: containerType.InspectResponse{ID: "c1", Config: &containerType.Config{Tty: false}},
+		}, nil).AnyTimes()
+	// a `--follow` stream that only ends with the command
+	r, w := io.Pipe()
+	t.Cleanup(func() { _ = w.Close() })
+	api.EXPECT().ContainerLogs(anyCancellableContext(), "c1", gomock.Any()).
+		DoAndReturn(func(ctx context.Context, _ string, _ client.ContainerLogsOptions) (io.ReadCloser, error) {
+			go func() {
+				<-ctx.Done()
+				_ = r.Close()
+			}()
+			return r, nil
+		}).AnyTimes()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tested.Logs(t.Context(), name, &testLogConsumer{}, compose.LogOptions{Follow: true})
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorContains(t, err, "reading the daemon time to subscribe to container events")
+		assert.ErrorContains(t, err, "yesterday-ish")
+	case <-time.After(10 * time.Second):
+		t.Fatal("logs --follow did not return the error of its monitor")
+	}
+}
+
+// TestComposeService_Logs_FollowLimitsConcurrentStreamOpens guards against a
+// regression where removing the concurrency bound entirely for `--follow`
+// (to stop it starving the monitor, see
+// TestComposeService_Logs_FollowDoesNotStarveMonitor) let an unbounded
+// number of ContainerLogs calls open at once. Opening a stream must still
+// respect maxConcurrency; only the (indefinite) copy that follows is exempt.
+func TestComposeService_Logs_FollowLimitsConcurrentStreamOpens(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli, WithMaxConcurrency(1))
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	ids := []string{"c1", "c2", "c3"}
+	var containerItems []containerType.Summary
+	for _, id := range ids {
+		containerItems = append(containerItems, testContainer("service", id, false))
+	}
+	expectNowAsDaemonTime(api)
+	api.EXPECT().ContainerList(gomock.Any(), gomock.Any()).
+		Return(client.ContainerListResult{Items: containerItems}, nil).
+		Times(2) // selectLogsContainers, then the monitor's initialContainers
+
+	for _, id := range ids {
+		api.EXPECT().
+			ContainerInspect(anyCancellableContext(), id, gomock.Any()).
+			Return(client.ContainerInspectResult{
+				Container: containerType.InspectResponse{
+					ID:     id,
+					Config: &containerType.Config{Tty: false},
+				},
+			}, nil)
+	}
+
+	tracker := &peakConcurrencyTracker{}
+	writers := make(chan *io.PipeWriter, len(ids))
+	for _, id := range ids {
+		api.EXPECT().ContainerLogs(anyCancellableContext(), id, gomock.Any()).
+			DoAndReturn(func(context.Context, string, client.ContainerLogsOptions) (io.ReadCloser, error) {
+				tracker.enter()
+				time.Sleep(20 * time.Millisecond) // widen the window for a concurrency violation to show up
+				tracker.leave()
+
+				r, w := io.Pipe()
+				writers <- w
+				return r, nil
+			})
+	}
+
+	started := make(chan struct{})
+	api.EXPECT().Events(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ client.EventsListOptions) client.EventsResult {
+			close(started)
+			return client.EventsResult{Messages: make(chan events.Message), Err: make(chan error)}
+		})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tested.Logs(ctx, name, &testLogConsumer{}, compose.LogOptions{Follow: true})
+	}()
+
+	<-started
+	var openedWriters []*io.PipeWriter
+	for range ids {
+		select {
+		case w := <-writers:
+			openedWriters = append(openedWriters, w)
+		case <-time.After(5 * time.Second):
+			t.Fatal("not all follow-mode streams opened: maxConcurrency must bound the open burst, not the whole call")
+		}
+	}
+
+	cancel()
+	for _, w := range openedWriters {
+		_ = w.Close()
+	}
+	assert.NilError(t, <-done)
+	assert.Equal(t, tracker.Peak(), 1, "opening follow-mode log streams must be bounded by maxConcurrency")
+}
+
+// TestDoLogContainer_ReleasesSlotOnPanic guards against a semaphore slot leak:
+// doLogContainer releases limiter's slot right after ContainerLogs returns
+// rather than via defer (so a --follow stream doesn't pin it for its whole
+// lifetime, see TestComposeService_Logs_FollowDoesNotStarveMonitor). A panic
+// inside ContainerLogs must still release it, or the effective concurrency
+// limit drops by one for the rest of the process.
+func TestDoLogContainer_ReleasesSlotOnPanic(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	svc := tested.(*composeService)
+
+	limiter := semaphore.NewWeighted(1)
+	assert.NilError(t, limiter.Acquire(t.Context(), 1)) // simulates the slot logContainer would have acquired via concurrency.Acquire
+
+	api.EXPECT().ContainerLogs(anyCancellableContext(), "c1", gomock.Any()).
+		DoAndReturn(func(context.Context, string, client.ContainerLogsOptions) (io.ReadCloser, error) {
+			panic("boom")
+		})
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_ = svc.doLogContainer(t.Context(), limiter, &testLogConsumer{}, "c1", containerType.InspectResponse{ID: "c1"}, compose.LogOptions{}, nil)
+	}()
+
+	assert.Assert(t, limiter.TryAcquire(1), "slot must be released even when ContainerLogs panics")
+}
+
+// panicReader panics on every Read, simulating a corrupted-stream panic
+// happening after doLogContainer's slot has already been released.
+type panicReader struct{}
+
+func (panicReader) Read([]byte) (int, error) {
+	panic("boom-copy")
+}
+
+// TestDoLogContainer_CopyPanicDoesNotDoubleReleaseSlot guards against a
+// double-release: doLogContainer's slot-release guard must only cover the
+// acquire-to-release window around ContainerLogs, not the copy loop that
+// follows. A panic after that point must propagate unmodified, not trigger a
+// second concurrency.Release on an already-released semaphore (which would either
+// panic on its own — masking the real panic — or silently corrupt the
+// semaphore's count).
+func TestDoLogContainer_CopyPanicDoesNotDoubleReleaseSlot(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	svc := tested.(*composeService)
+
+	limiter := semaphore.NewWeighted(1)
+	assert.NilError(t, limiter.Acquire(t.Context(), 1)) // simulates the slot logContainer would have acquired via concurrency.Acquire
+
+	api.EXPECT().ContainerLogs(anyCancellableContext(), "c1", gomock.Any()).
+		Return(io.NopCloser(panicReader{}), nil)
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = svc.doLogContainer(t.Context(), limiter, &testLogConsumer{}, "c1", containerType.InspectResponse{ID: "c1", Config: &containerType.Config{Tty: true}}, compose.LogOptions{}, nil)
+	}()
+
+	assert.Equal(t, recovered, "boom-copy", "the copy-loop panic must propagate unmodified, not be replaced by a semaphore double-release panic")
+	assert.Assert(t, limiter.TryAcquire(1), "slot must have been released exactly once, right after ContainerLogs returned")
+}
+
+// TestInspectWithSlot_ReleasesSlotOnPanic guards against the same semaphore
+// slot leak as TestDoLogContainer_ReleasesSlotOnPanic, one function earlier
+// in the acquire/release chain: inspectWithSlot only releases its slot via an
+// explicit, non-deferred call on the error path (success transfers ownership
+// to doLogContainer). A panic inside ContainerInspect must still release it.
+func TestInspectWithSlot_ReleasesSlotOnPanic(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+	svc := tested.(*composeService)
+
+	limiter := semaphore.NewWeighted(1)
+
+	api.EXPECT().ContainerInspect(anyCancellableContext(), "c1", gomock.Any()).
+		DoAndReturn(func(context.Context, string, client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+			panic("boom")
+		})
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_, _ = svc.inspectWithSlot(t.Context(), limiter, "c1")
+	}()
+
+	assert.Assert(t, limiter.TryAcquire(1), "slot must be released even when ContainerInspect panics")
+}
+
+type testLogConsumer struct {
+	mu sync.Mutex
+	// logs is keyed by container ID; values are log lines
+	logs map[string][]string
+}
+
+func (l *testLogConsumer) Log(containerName, message string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.logs == nil {
+		l.logs = make(map[string][]string)
+	}
+	l.logs[containerName] = append(l.logs[containerName], message)
+}
+
+func (l *testLogConsumer) Err(containerName, message string) {
+	l.Log(containerName, message)
+}
+
+func (l *testLogConsumer) Status(containerName, msg string) {}
+
+func (l *testLogConsumer) LogsForContainer(containerName string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.logs[containerName]
+}
+
+// TestComposeService_Logs_FollowWithoutInfo: `logs --follow` never needed the
+// engine's system information, and still follows on one that doesn't expose it
+// (a read-only socket proxy): events are subscribed to live, with no starting
+// point, rather than the command failing on a request it can do without.
+func TestComposeService_Logs_FollowWithoutInfo(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	api, cli := prepareMocks(mockCtrl)
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
+
+	name := strings.ToLower(testProject)
+
+	api.EXPECT().Info(gomock.Any(), gomock.Any()).Return(client.SystemInfoResult{}, errors.New("403 Forbidden"))
+	api.EXPECT().ContainerList(gomock.Any(), gomock.Any()).
+		Return(client.ContainerListResult{
+			Items: []containerType.Summary{testContainer("service", "c1", false)},
+		}, nil).
+		Times(2) // selectLogsContainers, then the monitor's initialContainers
+	api.EXPECT().ContainerInspect(anyCancellableContext(), "c1", gomock.Any()).
+		Return(client.ContainerInspectResult{
+			Container: containerType.InspectResponse{ID: "c1", Config: &containerType.Config{Tty: false}},
+		}, nil)
+	r, w := io.Pipe()
+	t.Cleanup(func() { _ = r.Close() })
+	api.EXPECT().ContainerLogs(anyCancellableContext(), "c1", gomock.Any()).Return(r, nil)
+	subscribed := make(chan client.EventsListOptions, 1)
+	api.EXPECT().Events(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, opts client.EventsListOptions) client.EventsResult {
+			subscribed <- opts
+			return client.EventsResult{Messages: make(chan events.Message), Err: make(chan error)}
+		})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- tested.Logs(ctx, name, &testLogConsumer{}, compose.LogOptions{Follow: true})
+	}()
+
+	select {
+	case opts := <-subscribed:
+		assert.Equal(t, opts.Since, "")
+	case err := <-done:
+		t.Fatalf("logs --follow ended instead of following: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the monitor never subscribed to events")
+	}
+	cancel()
+	_ = w.Close()
+	assert.NilError(t, <-done)
+}

@@ -1,0 +1,6 @@
+bin/
+/.vscode/
+coverage.out
+covdatafiles/
+.DS_Store
+internal/e2e/*.tar

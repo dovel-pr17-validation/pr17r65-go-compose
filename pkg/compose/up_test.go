@@ -1,0 +1,338 @@
+/*
+   Copyright 2020 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package compose
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/compose-spec/compose-go/v2/types"
+	containerType "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"go.uber.org/mock/gomock"
+	"golang.org/x/sync/errgroup"
+	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/internal/concurrency"
+	"github.com/docker/compose/v5/internal/logstream"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/utils"
+)
+
+func TestShouldFollowStartEvent(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    api.ContainerEvent
+		attached []string
+		attachTo []string
+		want     bool
+	}{
+		{
+			name: "ignores non-start events",
+			event: api.ContainerEvent{
+				Type:    api.ContainerEventExited,
+				Service: "validator",
+			},
+			attachTo: []string{"validator"},
+			want:     false,
+		},
+		{
+			name: "ignores services outside explicit attach selection",
+			event: api.ContainerEvent{
+				Type:    api.ContainerEventStarted,
+				Service: "event-bus-validator",
+				ID:      "event-bus-validator-1",
+			},
+			attachTo: []string{"validator"},
+			want:     false,
+		},
+		{
+			name: "ignores containers already attached unless restarting",
+			event: api.ContainerEvent{
+				Type:    api.ContainerEventStarted,
+				Service: "validator",
+				ID:      "validator-1",
+			},
+			attached: []string{"validator-1"},
+			attachTo: []string{"validator"},
+			want:     false,
+		},
+		{
+			name: "follows restarts for attached service",
+			event: api.ContainerEvent{
+				Type:       api.ContainerEventStarted,
+				Service:    "validator",
+				ID:         "validator-1",
+				Restarting: true,
+			},
+			attached: []string{"validator-1"},
+			attachTo: []string{"validator"},
+			want:     true,
+		},
+		{
+			name: "follows selected service when not already attached",
+			event: api.ContainerEvent{
+				Type:    api.ContainerEventStarted,
+				Service: "validator",
+				ID:      "validator-2",
+			},
+			attachTo: []string{"validator"},
+			want:     true,
+		},
+		{
+			name: "follows service when no explicit attach filter exists",
+			event: api.ContainerEvent{
+				Type:    api.ContainerEventStarted,
+				Service: "validator",
+				ID:      "validator-2",
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldFollowStartEvent(tt.event, tt.attached, tt.attachTo)
+			assert.Equal(t, got, tt.want)
+		})
+	}
+}
+
+// TestIsLateStarter is a follow-up to #14140's on-exit-only fix (glours'
+// review on that PR): stopOnFirstExit's own sweep isn't the only path that
+// can race a service still climbing the dependency graph on its
+// uncancelable context -- a graceful Ctrl+C/SIGTERM teardown does too, and
+// arrives with u.isTerminated already true regardless of which path set it.
+// isLateStarter must gate on that shared flag, not on which listener
+// happened to trigger termination.
+func TestIsLateStarter(t *testing.T) {
+	tests := []struct {
+		name       string
+		event      api.ContainerEvent
+		terminated bool
+		want       bool
+	}{
+		{
+			name:       "a container starting before termination is not a late starter",
+			event:      api.ContainerEvent{Type: api.ContainerEventStarted},
+			terminated: false,
+			want:       false,
+		},
+		{
+			name:       "a non-start event after termination is not a late starter",
+			event:      api.ContainerEvent{Type: api.ContainerEventExited},
+			terminated: true,
+			want:       false,
+		},
+		{
+			name:       "a container starting after termination is a late starter",
+			event:      api.ContainerEvent{Type: api.ContainerEventStarted},
+			terminated: true,
+			want:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isLateStarter(tt.event, tt.terminated)
+			assert.Equal(t, got, tt.want)
+		})
+	}
+}
+
+// TestAppendErrDropsCancellationAfterShutdown is the #13985 follow-up: once
+// our own shutdown has canceled globalCtx (monitor detecting termination,
+// SIGINT/SIGTERM, ...), a lingering goroutine (log/attach streaming) racing
+// that cancellation reports a context.Canceled error carrying no real
+// failure. appendErr must drop it instead of turning a clean exit into a
+// non-zero one, while still reporting any other, genuine error.
+func TestAppendErrDropsCancellationAfterShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	u := &upSession{globalCtx: ctx}
+
+	u.appendErr(errors.New("boom"))
+	assert.Equal(t, len(u.errs), 1)
+
+	cancel()
+
+	u.appendErr(fmt.Errorf("streaming logs: %w", context.Canceled))
+	assert.Equal(t, len(u.errs), 1, "a context-canceled error after our own shutdown must be dropped")
+
+	u.appendErr(errors.New("a real, unrelated failure"))
+	assert.Equal(t, len(u.errs), 2, "a genuine error occurring after shutdown must still be reported")
+}
+
+// TestAppendErrKeepsCancellationBeforeShutdown pins the guard on
+// globalCtx.Err(): a context.Canceled error must still be reported if it
+// didn't come from our own globalCtx being canceled.
+func TestAppendErrKeepsCancellationBeforeShutdown(t *testing.T) {
+	u := &upSession{globalCtx: t.Context()}
+
+	u.appendErr(context.Canceled)
+	assert.Equal(t, len(u.errs), 1)
+}
+
+// TestUpSessionStopsWithUpTimeout locks that the stops an attached up issues
+// itself carry -t (#14394).
+func TestUpSessionStopsWithUpTimeout(t *testing.T) {
+	timeout := 2 * time.Second
+	stops := map[string]func(*upSession){
+		"stopApplication": (*upSession).stopApplication,
+		"stopLateStarter": func(u *upSession) { u.stopLateStarter("svc0") },
+	}
+	for name, stop := range stops {
+		t.Run(name, func(t *testing.T) {
+			svc, apiClient := newTestService(t)
+			project, containers := nIndependentServiceContainers(1)
+			apiClient.EXPECT().ContainerList(gomock.Any(), gomock.Any()).
+				Return(client.ContainerListResult{Items: containers}, nil)
+			var got client.ContainerStopOptions
+			apiClient.EXPECT().ContainerStop(gomock.Any(), "c0", gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ string, opts client.ContainerStopOptions) (client.ContainerStopResult, error) {
+					got = opts
+					return client.ContainerStopResult{}, nil
+				})
+
+			u := &upSession{
+				composeService: svc,
+				project:        project,
+				globalCtx:      t.Context(),
+				printer:        newLogPrinter(&testLogConsumer{}),
+				options:        api.UpOptions{Create: api.CreateOptions{Timeout: &timeout}},
+			}
+			stop(u)
+			assert.NilError(t, u.eg.Wait())
+			assert.Equal(t, len(u.errs), 0, "%v", u.errs)
+			assert.DeepEqual(t, got, client.ContainerStopOptions{Timeout: utils.DurationSecondToInt(&timeout)})
+		})
+	}
+}
+
+// TestStreamContainerLogs_ConcurrencyIsBounded guards a regression flagged
+// in review: streamContainerLogs (attaches logs for containers that start
+// after up's initial attach, e.g. via depends_on/restart/watch rebuilds)
+// used to call ContainerInspect directly and pass nil to doLogContainer, so
+// unlike `compose logs --follow` it never shared --parallel's budget
+// bounding concurrent log-open calls.
+func TestStreamContainerLogs_ConcurrencyIsBounded(t *testing.T) {
+	svc, apiClient := newTestService(t, WithMaxConcurrency(1))
+
+	tracker := &peakConcurrencyTracker{}
+	for _, id := range []string{"c1", "c2"} {
+		apiClient.EXPECT().ContainerInspect(gomock.Any(), id, gomock.Any()).
+			DoAndReturn(func(context.Context, string, client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+				tracker.enter()
+				time.Sleep(20 * time.Millisecond) // widen the window for a concurrency violation to show up
+				tracker.leave()
+				return client.ContainerInspectResult{
+					Container: containerType.InspectResponse{
+						ID:     id,
+						Config: &containerType.Config{Tty: false},
+						State:  &containerType.State{},
+					},
+				}, nil
+			})
+		apiClient.EXPECT().ContainerLogs(gomock.Any(), id, gomock.Any()).
+			Return(io.NopCloser(strings.NewReader("")), nil)
+	}
+
+	u := &upSession{
+		composeService: svc,
+		globalCtx:      t.Context(),
+		logOpenLimiter: concurrency.NewLimiter(1),
+		options:        api.UpOptions{Start: api.StartOptions{Attach: &testLogConsumer{}}},
+	}
+
+	var eg errgroup.Group
+	eg.Go(func() error {
+		return u.streamContainerLogs(logstream.NewCursors().Enter("c1"), api.ContainerEvent{ID: "c1", Service: "web"}, "")
+	})
+	eg.Go(func() error {
+		return u.streamContainerLogs(logstream.NewCursors().Enter("c2"), api.ContainerEvent{ID: "c2", Service: "web"}, "")
+	})
+	assert.NilError(t, eg.Wait())
+	assert.Equal(t, tracker.Peak(), 1, "streamContainerLogs must share --parallel's budget for concurrent log-attach opens")
+}
+
+func TestSetupNavigationMenuWithoutImplementation(t *testing.T) {
+	s := &composeService{}
+	options := api.UpOptions{Start: api.StartOptions{NavigationMenu: true}}
+
+	menu, err := s.setupNavigationMenu(t.Context(), &options, make(chan os.Signal, 1))
+
+	assert.NilError(t, err)
+	assert.Assert(t, menu == nil)
+	assert.Assert(t, !options.Start.NavigationMenu)
+}
+
+// fakeMenu records how the session drives a NavigationMenu.
+type fakeMenu struct {
+	openErr error
+	opened  bool
+}
+
+func (m *fakeMenu) Decorate(l api.LogConsumer) api.LogConsumer         { return l }
+func (m *fakeMenu) EnableWatch(bool, api.Feature)                      {}
+func (m *fakeMenu) EnableDetach(func())                                {}
+func (m *fakeMenu) Run(context.Context, *types.Project, api.UpOptions) {}
+func (m *fakeMenu) Close() error                                       { return nil }
+func (m *fakeMenu) Open() error {
+	m.opened = true
+	return m.openErr
+}
+
+func TestSetupNavigationMenu(t *testing.T) {
+	tests := []struct {
+		name     string
+		menu     NavigationMenu
+		wantMenu bool
+	}{
+		{name: "usable", menu: &fakeMenu{}, wantMenu: true},
+		{name: "keyboard can't be grabbed", menu: &fakeMenu{openErr: errors.New("no tty")}},
+		{name: "factory without menu"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, apiClient := newTestService(t, WithNavigationMenu(func(bool, bool, chan<- os.Signal) NavigationMenu {
+				return tt.menu
+			}))
+			apiClient.EXPECT().Info(gomock.Any(), gomock.Any()).Return(client.SystemInfoResult{}, nil).AnyTimes()
+			options := api.UpOptions{Start: api.StartOptions{NavigationMenu: true}}
+
+			menu, err := svc.setupNavigationMenu(t.Context(), &options, make(chan os.Signal, 1))
+
+			assert.NilError(t, err)
+			assert.Equal(t, menu != nil, tt.wantMenu)
+			assert.Equal(t, options.Start.NavigationMenu, tt.wantMenu, "the option must be disabled when there is no usable menu")
+			if fm, ok := tt.menu.(*fakeMenu); ok {
+				assert.Assert(t, fm.opened, "the keyboard must be grabbed through the menu")
+			}
+		})
+	}
+}
+
+func TestWithNavigationMenu(t *testing.T) {
+	s := &composeService{}
+	assert.NilError(t, WithNavigationMenu(func(bool, bool, chan<- os.Signal) NavigationMenu { return nil })(s))
+	assert.Assert(t, s.navigationMenu != nil)
+}

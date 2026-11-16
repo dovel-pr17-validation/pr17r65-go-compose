@@ -1,0 +1,213 @@
+/*
+   Copyright 2023 Docker Compose CLI authors
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package oci
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/errdefs"
+	"github.com/distribution/reference"
+	"github.com/moby/buildkit/util/contentutil"
+	"github.com/opencontainers/go-digest"
+	spec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/docker/compose/v5/internal/registry"
+)
+
+// NewResolver sets up an OCI Resolver using credentials to provide registry
+// credentials. When transport is non-nil it is used as the HTTP
+// transport for both registry calls and the authorizer's token fetches
+// (e.g. to route both through Docker Desktop's PAC-aware proxy); nil falls
+// back to containerd's default transport.
+func NewResolver(credentials registry.AuthProvider, transport http.RoundTripper, insecureRegistries ...string) remotes.Resolver {
+	authOpts := []docker.AuthorizerOpt{
+		docker.WithAuthCreds(func(host string) (string, string, error) {
+			host = registry.GetAuthConfigKey(host)
+			auth, err := credentials.GetAuthConfig(host)
+			if err != nil {
+				return "", "", err
+			}
+			if auth.IdentityToken != "" {
+				return "", auth.IdentityToken, nil
+			}
+			return auth.Username, auth.Password, nil
+		}),
+	}
+	if transport != nil {
+		authOpts = append(authOpts, docker.WithAuthClient(&http.Client{Transport: transport}))
+	}
+	opts := []docker.RegistryOpt{
+		docker.WithAuthorizer(docker.NewDockerAuthorizer(authOpts...)),
+		docker.WithPlainHTTP(func(domain string) (bool, error) {
+			// Should be used for testing **only**
+			return slices.Contains(insecureRegistries, domain), nil
+		}),
+	}
+	if transport != nil {
+		opts = append(opts, docker.WithClient(&http.Client{Transport: transport}))
+	}
+	return docker.NewResolver(docker.ResolverOptions{
+		Hosts: docker.ConfigureDefaultRegistries(opts...),
+	})
+}
+
+// Get retrieves a Named OCI resource and returns OCI Descriptor and Manifest.
+// The manifest is verified against the digest of the descriptor: for a tag the
+// registry says which digest the tag resolves to, for a digested reference the
+// digest is the reference's own, and either way the registry is not trusted to
+// serve the content that digest identifies.
+func Get(ctx context.Context, resolver remotes.Resolver, ref reference.Named) (spec.Descriptor, []byte, error) {
+	_, descriptor, err := resolver.Resolve(ctx, ref.String())
+	if err != nil {
+		return spec.Descriptor{}, nil, err
+	}
+
+	fetcher, err := resolver.Fetcher(ctx, ref.String())
+	if err != nil {
+		return spec.Descriptor{}, nil, err
+	}
+	fetch, err := fetcher.Fetch(ctx, descriptor)
+	if err != nil {
+		return spec.Descriptor{}, nil, err
+	}
+	defer func() { _ = fetch.Close() }()
+	// the reader returns no more than the size of the descriptor, which the resolver
+	// keeps within what it accepts for a manifest
+	content, err := io.ReadAll(fetch)
+	if err != nil {
+		return spec.Descriptor{}, nil, fmt.Errorf("reading manifest %s: %w", descriptor.Digest, err)
+	}
+	if err := verifyDigest("manifest", descriptor.Digest, content); err != nil {
+		return spec.Descriptor{}, nil, err
+	}
+	return descriptor, content, nil
+}
+
+// verifyDigest checks content, which is what, against the digest it is supposed
+// to have. The content is fetched without going through containerd's content
+// store, which is what would otherwise check it, and callers use the digest to
+// identify the content (as a cache key, or to tell it is the one a reference
+// pins).
+func verifyDigest(what string, expected digest.Digest, content []byte) error {
+	if err := expected.Validate(); err != nil {
+		return fmt.Errorf("invalid digest %s: %w", expected, err)
+	}
+	if actual := expected.Algorithm().FromBytes(content); actual != expected {
+		return fmt.Errorf("%s digest mismatch: expected %s, got %s", what, expected, actual)
+	}
+	return nil
+}
+
+// GetBlob retrieves the content of a blob descriptor (e.g. an artifact layer)
+// from the repository ref belongs to. Unlike Get it doesn't Resolve the
+// digest, as the registry manifests endpoint only serves actual manifests;
+// blob content must be fetched directly from the blobs endpoint.
+func GetBlob(ctx context.Context, resolver remotes.Resolver, ref reference.Named, descriptor spec.Descriptor) ([]byte, error) {
+	fetcher, err := resolver.Fetcher(ctx, ref.String())
+	if err != nil {
+		return nil, fmt.Errorf("creating fetcher for %s: %w", ref, err)
+	}
+	fetch, err := fetcher.Fetch(ctx, descriptor)
+	if err != nil {
+		return nil, fmt.Errorf("fetching blob %s: %w", descriptor.Digest, err)
+	}
+	defer func() { _ = fetch.Close() }()
+	// bound the read by the declared size so a rogue registry can't cause
+	// unbounded allocation; the extra byte detects oversized responses.
+	content, err := io.ReadAll(io.LimitReader(fetch, descriptor.Size+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading blob %s: %w", descriptor.Digest, err)
+	}
+	if int64(len(content)) != descriptor.Size {
+		return nil, fmt.Errorf("blob %s size mismatch: expected %d bytes, got %d", descriptor.Digest, descriptor.Size, len(content))
+	}
+	// GetBlob bypasses containerd's content store, so integrity must be
+	// checked here before callers write the bytes to disk.
+	if err := verifyDigest("blob", descriptor.Digest, content); err != nil {
+		return nil, err
+	}
+	return content, nil
+}
+
+func Copy(ctx context.Context, resolver remotes.Resolver, image reference.Named, named reference.Named) (spec.Descriptor, error) {
+	src, desc, err := resolver.Resolve(ctx, image.String())
+	if err != nil {
+		return spec.Descriptor{}, err
+	}
+	if desc.Annotations == nil {
+		desc.Annotations = make(map[string]string)
+	}
+	// set LabelDistributionSource so push will actually use a registry mount
+	refspec := reference.TrimNamed(image).String()
+	u, err := url.Parse("dummy://" + refspec)
+	if err != nil {
+		return spec.Descriptor{}, err
+	}
+	source, repo := u.Hostname(), strings.TrimPrefix(u.Path, "/")
+	desc.Annotations[labels.LabelDistributionSource+"."+source] = repo
+
+	p, err := resolver.Pusher(ctx, named.Name())
+	if err != nil {
+		return spec.Descriptor{}, err
+	}
+	f, err := resolver.Fetcher(ctx, src)
+	if err != nil {
+		return spec.Descriptor{}, err
+	}
+
+	err = contentutil.CopyChain(ctx,
+		contentutil.FromPusher(p),
+		contentutil.FromFetcher(f), desc)
+	return desc, err
+}
+
+func Push(ctx context.Context, resolver remotes.Resolver, ref reference.Named, descriptor spec.Descriptor) error {
+	pusher, err := resolver.Pusher(ctx, ref.String())
+	if err != nil {
+		return err
+	}
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, ComposeYAMLMediaType, "artifact-")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, ComposeEnvFileMediaType, "artifact-")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, ComposeEmptyConfigMediaType, "config-")
+	ctx = remotes.WithMediaTypeKeyPrefix(ctx, spec.MediaTypeEmptyJSON, "config-")
+
+	push, err := pusher.Push(ctx, descriptor)
+	if errdefs.IsAlreadyExists(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	_, err = push.Write(descriptor.Data)
+	if err != nil {
+		// Close the writer on error since Commit won't be called
+		_ = push.Close()
+		return err
+	}
+	// Commit will close the writer
+	return push.Commit(ctx, int64(len(descriptor.Data)), descriptor.Digest)
+}
